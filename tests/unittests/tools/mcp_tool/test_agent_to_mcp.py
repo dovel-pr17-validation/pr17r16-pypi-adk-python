@@ -1,0 +1,527 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import gc
+from types import SimpleNamespace
+from typing import Any
+from typing import AsyncGenerator
+from typing import Optional
+import weakref
+
+from google.adk.agents.base_agent import BaseAgent
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.events.event import Event
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.tools.mcp_tool._agent_to_mcp import _connection_key
+from google.adk.tools.mcp_tool._agent_to_mcp import _MAX_REAP_ATTEMPTS
+from google.adk.tools.mcp_tool._agent_to_mcp import _reap_orphaned_sessions
+from google.adk.tools.mcp_tool._agent_to_mcp import _run_agent
+from google.adk.tools.mcp_tool._agent_to_mcp import to_mcp_server
+from google.genai import types
+import pytest
+
+from ._in_memory_session import connected_client_session
+from ._sdk_compat import field
+
+
+class _EchoAgent(BaseAgent):
+  """Minimal agent that emits a single final text event."""
+
+  reply: str = "hello from the agent"
+
+  async def _run_async_impl(
+      self, ctx: InvocationContext
+  ) -> AsyncGenerator[Event, None]:
+    yield Event(
+        author=self.name,
+        content=types.Content(
+            role="model", parts=[types.Part(text=self.reply)]
+        ),
+    )
+
+
+def _text_event(text: str, *, partial: bool = False) -> Event:
+  return Event(
+      author="a",
+      partial=partial,
+      content=types.Content(role="model", parts=[types.Part(text=text)]),
+  )
+
+
+def _image_event(data: bytes, mime_type: str) -> Event:
+  return Event(
+      author="a",
+      content=types.Content(
+          role="model",
+          parts=[
+              types.Part(inline_data=types.Blob(data=data, mime_type=mime_type))
+          ],
+      ),
+  )
+
+
+class _FakeSessionService(InMemorySessionService):
+
+  def __init__(self, runner: _FakeRunner):
+    super().__init__()
+    self._runner = runner
+
+  async def create_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+  ) -> Any:
+    del state, session_id
+    return await self._runner._create_session(
+        app_name=app_name, user_id=user_id
+    )
+
+  async def delete_session(
+      self, *, app_name: str, user_id: str, session_id: str
+  ) -> None:
+    await self._runner._delete_session(
+        app_name=app_name, user_id=user_id, session_id=session_id
+    )
+
+
+class _FakeRunner:
+  """Runner stub that yields a fixed event sequence."""
+
+  app_name = "fake"
+
+  def __init__(self, events: list[Event]):
+    self._events = events
+    self.create_session_calls = 0
+    self.session_ids: list[str] = []
+    self.deleted_session_ids: list[str] = []
+    self.failing_deletes = 0
+    self.create_session_delay = 0.0
+    self.session_service = _FakeSessionService(self)
+
+  async def _create_session(self, *, app_name: str, user_id: str):
+    if self.create_session_delay > 0:
+      await asyncio.sleep(self.create_session_delay)
+    self.create_session_calls += 1
+    return SimpleNamespace(id=f"session-{self.create_session_calls}")
+
+  async def _delete_session(
+      self, *, app_name: str, user_id: str, session_id: str
+  ):
+    if self.failing_deletes > 0:
+      self.failing_deletes -= 1
+      raise ConnectionError("session service unavailable")
+    self.deleted_session_ids.append(session_id)
+
+  async def run_async(
+      self, *, user_id: str, session_id: str, new_message: types.Content
+  ) -> AsyncGenerator[Event, None]:
+    self.session_ids.append(session_id)
+    for event in self._events:
+      yield event
+
+
+class _ConnCtx:
+  """Fake MCP Context carrying a per-connection session object."""
+
+  def __init__(self, session: object):
+    self.session = session
+
+  async def report_progress(self, *, progress, total=None, message=None):
+    pass
+
+
+class _Connection:
+  """Stand-in for an MCP connection object (weak-referenceable)."""
+
+
+class _RequestScopedSession:
+  """Stand-in for an MCP SDK 2.x ServerSession.
+
+  The 2.x server builds one of these per inbound request and holds the
+  connection on the private ``_connection``. It is hashable, like the real
+  class, so a stale per-request key silently starts a new conversation rather
+  than raising.
+  """
+
+  def __init__(self, connection: object):
+    self._connection = connection
+
+
+class _RequestScopedCtx:
+  """Fake MCP Context shaped like MCP SDK 2.x."""
+
+  def __init__(self, connection: object):
+    self.session = _RequestScopedSession(connection)
+
+  async def report_progress(self, *, progress, total=None, message=None):
+    pass
+
+
+@pytest.mark.asyncio
+async def test_to_mcp_server_registers_agent_as_single_tool():
+  agent = _EchoAgent(name="my_agent", description="does useful things")
+
+  server = to_mcp_server(agent)
+  tools = await server.list_tools()
+
+  assert len(tools) == 1
+  assert tools[0].name == "my_agent"
+  assert tools[0].description == "does useful things"
+  assert "request" in field(tools[0], "inputSchema")["properties"]
+
+
+@pytest.mark.asyncio
+async def test_to_mcp_server_name_override():
+  agent = _EchoAgent(name="my_agent")
+
+  server = to_mcp_server(agent, name="custom")
+  tools = await server.list_tools()
+
+  assert tools[0].name == "custom"
+
+
+@pytest.mark.asyncio
+async def test_call_tool_runs_agent_end_to_end():
+  agent = _EchoAgent(name="assistant")
+  server = to_mcp_server(agent)
+
+  async with connected_client_session(server) as client:
+    result = await client.call_tool("assistant", {"request": "hi"})
+
+  assert not field(result, "isError")
+  assert "hello from the agent" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_run_agent_returns_only_final_text():
+  runner = _FakeRunner([_text_event("answer")])
+
+  result = await _run_agent(runner, "hi")
+
+  assert [block.type for block in result] == ["text"]
+  assert result[0].text == "answer"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_reports_intermediate_events_as_progress():
+  reported: list[str] = []
+
+  class _Ctx:
+
+    async def report_progress(self, *, progress, total=None, message=None):
+      reported.append(message)
+
+  runner = _FakeRunner(
+      [_text_event("thinking", partial=True), _text_event("done")]
+  )
+
+  result = await _run_agent(runner, "hi", _Ctx())
+
+  assert result[0].text == "done"
+  assert reported == ["thinking"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_maps_image_output_to_image_content():
+  png = b"\x89PNG\r\n\x1a\n"
+  runner = _FakeRunner([_image_event(png, "image/png")])
+
+  result = await _run_agent(runner, "draw a logo")
+
+  assert len(result) == 1
+  assert result[0].type == "image"
+  assert field(result[0], "mimeType") == "image/png"
+  assert base64.b64decode(result[0].data) == png
+
+
+@pytest.mark.asyncio
+async def test_run_agent_reuses_one_session_per_connection():
+  runner = _FakeRunner([_text_event("ok")])
+  sessions: dict[object, str] = {}
+  ctx = _ConnCtx(_Connection())
+
+  await _run_agent(runner, "first", ctx, sessions)
+  await _run_agent(runner, "second", ctx, sessions)
+
+  assert runner.create_session_calls == 1
+  assert runner.session_ids == ["session-1", "session-1"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_uses_separate_sessions_across_connections():
+  runner = _FakeRunner([_text_event("ok")])
+  sessions: dict[object, str] = {}
+
+  await _run_agent(runner, "a", _ConnCtx(_Connection()), sessions)
+  await _run_agent(runner, "b", _ConnCtx(_Connection()), sessions)
+
+  assert runner.create_session_calls == 2
+  assert runner.session_ids == ["session-1", "session-2"]
+
+
+def test_connection_key_uses_the_session_when_it_has_no_connection():
+  """MCP SDK 1.x: the session is already one object per connection."""
+  session = _Connection()
+
+  assert _connection_key(_ConnCtx(session)) is session
+
+
+def test_connection_key_prefers_the_connection_behind_the_session():
+  """MCP SDK 2.x: the session is per request, the connection is not."""
+  connection = _Connection()
+  ctx = _RequestScopedCtx(connection)
+
+  assert _connection_key(ctx) is connection
+
+
+@pytest.mark.asyncio
+async def test_run_agent_reuses_one_session_when_sessions_are_per_request():
+  """Two requests on one connection stay in one conversation under SDK 2.x."""
+  runner = _FakeRunner([_text_event("ok")])
+  sessions: dict[object, str] = {}
+  connection = _Connection()
+
+  await _run_agent(runner, "first", _RequestScopedCtx(connection), sessions)
+  await _run_agent(runner, "second", _RequestScopedCtx(connection), sessions)
+
+  assert runner.create_session_calls == 1
+  assert runner.session_ids == ["session-1", "session-1"]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_separates_connections_when_sessions_are_per_request():
+  """Separate clients never share a conversation under SDK 2.x."""
+  runner = _FakeRunner([_text_event("ok")])
+  sessions: dict[object, str] = {}
+
+  await _run_agent(runner, "a", _RequestScopedCtx(_Connection()), sessions)
+  await _run_agent(runner, "b", _RequestScopedCtx(_Connection()), sessions)
+
+  assert runner.create_session_calls == 2
+  assert runner.session_ids == ["session-1", "session-2"]
+
+
+@pytest.mark.asyncio
+async def test_reap_deletes_only_sessions_no_longer_reachable():
+  runner = _FakeRunner([_text_event("ok")])
+  connection = _Connection()
+  sessions: dict[object, str] = {connection: "session-live"}
+  created = {"session-live", "session-dead"}
+
+  await _reap_orphaned_sessions(runner, sessions, created)
+
+  assert runner.deleted_session_ids == ["session-dead"]
+  assert created == {"session-live"}
+
+
+@pytest.mark.asyncio
+async def test_session_of_a_collected_connection_is_reaped():
+  """A conversation must not outlive its connection in the session service."""
+  runner = _FakeRunner([_text_event("ok")])
+  sessions: weakref.WeakKeyDictionary[object, str] = (
+      # pylint: disable-next=abstract-class-instantiated
+      weakref.WeakKeyDictionary()
+  )
+  created: set[str] = set()
+  ctx = _ConnCtx(_Connection())
+
+  await _run_agent(runner, "hi", ctx, sessions, created)
+  del ctx
+  gc.collect()
+  await _reap_orphaned_sessions(runner, sessions, created)
+
+  assert runner.deleted_session_ids == ["session-1"]
+  assert not created
+
+
+@pytest.mark.asyncio
+async def test_per_request_connections_do_not_accumulate_sessions():
+  """Stateless streamable HTTP builds a fresh connection per request; each
+  request's session must be reclaimed instead of leaking one per tool call."""
+  runner = _FakeRunner([_text_event("ok")])
+  sessions: weakref.WeakKeyDictionary[object, str] = (
+      # pylint: disable-next=abstract-class-instantiated
+      weakref.WeakKeyDictionary()
+  )
+  created: set[str] = set()
+
+  for request in ("a", "b", "c"):
+    await _reap_orphaned_sessions(runner, sessions, created)
+    ctx = _RequestScopedCtx(_Connection())
+    await _run_agent(runner, request, ctx, sessions, created)
+    del ctx
+    gc.collect()
+  await _reap_orphaned_sessions(runner, sessions, created)
+
+  assert runner.deleted_session_ids == ["session-1", "session-2", "session-3"]
+  assert not created
+
+
+@pytest.mark.asyncio
+async def test_reap_failure_does_not_raise_and_is_retried():
+  """A session service outage must not fail the live tool call, and the
+  orphaned session must be deleted once the service recovers."""
+  runner = _FakeRunner([_text_event("ok")])
+  runner.failing_deletes = 1
+  connection = _Connection()
+  sessions: dict[object, str] = {connection: "session-live"}
+  created = {"session-live", "session-dead"}
+  reap_failures: dict[str, int] = {}
+
+  await _reap_orphaned_sessions(
+      runner, sessions, created, reap_failures=reap_failures
+  )
+
+  assert runner.deleted_session_ids == []
+  assert created == {"session-live", "session-dead"}
+  assert reap_failures == {"session-dead": 1}
+
+  await _reap_orphaned_sessions(
+      runner, sessions, created, reap_failures=reap_failures
+  )
+
+  assert runner.deleted_session_ids == ["session-dead"]
+  assert created == {"session-live"}
+  assert not reap_failures
+
+
+@pytest.mark.asyncio
+async def test_reap_failure_dropped_after_max_attempts():
+  """A session that repeatedly fails deletion is dropped after max attempts."""
+  runner = _FakeRunner([_text_event("ok")])
+  runner.failing_deletes = _MAX_REAP_ATTEMPTS + 2
+  connection = _Connection()
+  sessions: dict[object, str] = {connection: "session-live"}
+  created = {"session-live", "session-dead"}
+  reap_failures: dict[str, int] = {}
+
+  for _ in range(_MAX_REAP_ATTEMPTS):
+    await _reap_orphaned_sessions(
+        runner, sessions, created, reap_failures=reap_failures
+    )
+
+  assert runner.deleted_session_ids == []
+  assert created == {"session-live"}
+  assert not reap_failures
+
+
+@pytest.mark.asyncio
+async def test_reap_cancellation_restores_session_and_reraises():
+  """A task cancellation during delete_session must restore the session id."""
+  runner = _FakeRunner([_text_event("ok")])
+
+  async def _cancelled_delete(*, app_name: str, user_id: str, session_id: str):
+    del app_name, user_id, session_id
+    raise asyncio.CancelledError()
+
+  runner.session_service.delete_session = _cancelled_delete
+  connection = _Connection()
+  sessions: dict[object, str] = {connection: "session-live"}
+  created = {"session-live", "session-dead"}
+
+  with pytest.raises(asyncio.CancelledError):
+    await _reap_orphaned_sessions(runner, sessions, created)
+
+  assert created == {"session-live", "session-dead"}
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reaps_conversation_of_closed_connection():
+  agent = _EchoAgent(name="assistant")
+  runner = _FakeRunner([_text_event("ok")])
+  server = to_mcp_server(agent, runner=runner)
+
+  async with connected_client_session(server) as client:
+    await client.call_tool("assistant", {"request": "first"})
+  gc.collect()
+  async with connected_client_session(server) as client:
+    await client.call_tool("assistant", {"request": "second"})
+
+  assert runner.session_ids == ["session-1", "session-2"]
+  assert runner.deleted_session_ids == ["session-1"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_reuses_session_across_calls_on_one_connection():
+  agent = _EchoAgent(name="assistant")
+  runner = _FakeRunner([_text_event("ok")])
+  server = to_mcp_server(agent, runner=runner)
+
+  async with connected_client_session(server) as client:
+    await client.call_tool("assistant", {"request": "first"})
+    await client.call_tool("assistant", {"request": "second"})
+
+  assert runner.create_session_calls == 1
+  assert runner.session_ids == ["session-1", "session-1"]
+
+
+@pytest.mark.asyncio
+async def test_call_tool_concurrent_first_calls_reuse_session():
+  """Two concurrent first calls on one connection must share one session."""
+  agent = _EchoAgent(name="assistant")
+  runner = _FakeRunner([_text_event("ok")])
+  runner.create_session_delay = 0.01
+  server = to_mcp_server(agent, runner=runner)
+
+  async with connected_client_session(server) as client:
+    await asyncio.gather(
+        client.call_tool("assistant", {"request": "first"}),
+        client.call_tool("assistant", {"request": "second"}),
+    )
+
+  assert runner.create_session_calls == 1
+  assert runner.session_ids == ["session-1", "session-1"]
+  assert runner.deleted_session_ids == []
+
+
+@pytest.mark.asyncio
+async def test_call_tool_does_not_reap_persistent_session():
+  """A caller-supplied persistent session service must not have its sessions deleted on connection teardown."""
+  from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+  from google.adk.auth.credential_service.in_memory_credential_service import InMemoryCredentialService
+  from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+  from google.adk.runners import Runner
+  from google.adk.sessions.database_session_service import DatabaseSessionService
+
+  agent = _EchoAgent(name="assistant")
+  session_service = DatabaseSessionService(
+      db_url="sqlite+aiosqlite:///:memory:"
+  )
+  runner = Runner(
+      app_name="assistant",
+      agent=agent,
+      session_service=session_service,
+      artifact_service=InMemoryArtifactService(),
+      memory_service=InMemoryMemoryService(),
+      credential_service=InMemoryCredentialService(),
+  )
+  server = to_mcp_server(agent, runner=runner)
+
+  async with connected_client_session(server) as client:
+    await client.call_tool("assistant", {"request": "first"})
+  gc.collect()
+  async with connected_client_session(server) as client:
+    await client.call_tool("assistant", {"request": "second"})
+
+  sessions_response = await session_service.list_sessions(
+      app_name="assistant", user_id="mcp_user"
+  )
+  assert len(sessions_response.sessions) == 2

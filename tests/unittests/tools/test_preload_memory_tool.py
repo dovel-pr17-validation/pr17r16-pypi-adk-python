@@ -1,0 +1,380 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+from unittest import mock
+
+from google.adk.events.event import Event
+from google.adk.memory.base_memory_service import SearchMemoryResponse
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.memory.memory_entry import MemoryEntry
+from google.adk.models.gemini_context_cache_manager import GeminiContextCacheManager
+from google.adk.models.llm_request import LlmRequest
+from google.adk.sessions.session import Session
+from google.adk.tools.preload_memory_tool import PreloadMemoryTool
+from google.genai import types
+import pytest
+
+
+def _tool_context(*memories: MemoryEntry):
+  tool_context = mock.Mock()
+  tool_context.user_content = types.UserContent('current query')
+  tool_context.search_memory = mock.AsyncMock(
+      return_value=SearchMemoryResponse(memories=list(memories))
+  )
+  return tool_context
+
+
+def _memory(text: str) -> MemoryEntry:
+  return MemoryEntry(
+      content=types.UserContent(text),
+      author='user',
+      timestamp='2026-07-13T12:00:00Z',
+  )
+
+
+@pytest.mark.parametrize('thought', [True, False, None])
+@pytest.mark.asyncio
+async def test_preload_memory_preserves_visible_text_only(
+    thought: bool | None,
+) -> None:
+  """Recalled reasoning is not presented as a previous conversation answer."""
+  memory = MemoryEntry(
+      content=types.Content(
+          role='model',
+          parts=[
+              types.Part(text='Consider a zeppelin.', thought=thought),
+              types.Part(text='Take the train to Paris.'),
+          ],
+      ),
+      author='assistant',
+  )
+  request = LlmRequest()
+  original_content = memory.content.model_copy(deep=True)
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=_tool_context(memory), llm_request=request
+  )
+
+  assert request.contents[0].parts
+  recalled_text = request.contents[0].parts[0].text
+  assert recalled_text is not None
+  assert 'Take the train to Paris.' in recalled_text
+  assert ('Consider a zeppelin.' in recalled_text) == (not thought)
+  assert memory.content == original_content
+
+
+@pytest.mark.parametrize(
+    'parts',
+    [
+        [],
+        [types.Part(text='Consider a zeppelin.', thought=True)],
+        [
+            types.Part(
+                inline_data=types.Blob(data=b'hello', mime_type='text/plain')
+            )
+        ],
+    ],
+)
+@pytest.mark.asyncio
+async def test_preload_memory_omits_entries_without_visible_text(
+    parts: list[types.Part],
+) -> None:
+  """Empty, non-text and thought-only memories do not add conversation text."""
+  memory = MemoryEntry(
+      content=types.Content(role='model', parts=parts),
+      author='assistant',
+      timestamp='2026-07-13T12:00:00Z',
+  )
+  request = LlmRequest()
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=_tool_context(memory), llm_request=request
+  )
+
+  assert not request.contents
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_in_memory_service_skips_thought_parts() -> None:
+  """Thought-only events do not match or crowd out visible search results."""
+  memory_service = InMemoryMemoryService()
+  events = [
+      Event(
+          id=f'thought-{i}',
+          author='model',
+          timestamp=float(i),
+          content=types.Content(
+              role='model',
+              parts=[
+                  types.Part(text='Paris travel plan', thought=True),
+                  types.Part.from_function_call(name='lookup', args={}),
+              ],
+          ),
+      )
+      for i in range(10)
+  ]
+  events.append(
+      Event(
+          id='visible',
+          author='model',
+          timestamp=11.0,
+          content=types.Content(
+              role='model',
+              parts=[
+                  types.Part(text='Secret internal note', thought=True),
+                  types.Part(text='Take the train to Paris.'),
+              ],
+          ),
+      )
+  )
+  await memory_service.add_session_to_memory(
+      Session(
+          app_name='app',
+          user_id='user',
+          id='session-1',
+          events=events,
+      )
+  )
+
+  async def search_memory(query: str) -> SearchMemoryResponse:
+    return await memory_service.search_memory(
+        app_name='app', user_id='user', query=query
+    )
+
+  tool_context = mock.Mock()
+  tool_context.user_content = types.UserContent('Paris')
+  tool_context.search_memory = search_memory
+  request = LlmRequest()
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=tool_context, llm_request=request
+  )
+
+  assert request.contents[0].parts
+  recalled_text = request.contents[0].parts[0].text
+  assert recalled_text is not None
+  assert 'Take the train to Paris.' in recalled_text
+  assert 'Paris travel plan' not in recalled_text
+  assert 'Secret internal note' not in recalled_text
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_keeps_system_prefix_stable():
+  """Recalled memory goes into contents, never into the system instruction."""
+  request = LlmRequest(
+      contents=[
+          types.UserContent('historical question'),
+          types.ModelContent('historical answer'),
+          types.UserContent('current query'),
+      ]
+  )
+  request.config.system_instruction = 'stable instruction'
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=_tool_context(_memory('likes tea')),
+      llm_request=request,
+  )
+
+  assert request.config.system_instruction == 'stable instruction'
+  assert [content.role for content in request.contents] == [
+      'user',
+      'model',
+      'user',
+      'user',
+  ]
+  assert 'likes tea' in request.contents[-2].parts[0].text
+  assert request.contents[-1] == types.UserContent('current query')
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_stays_after_function_response_boundary():
+  """Recalled memory lands after a trailing function response."""
+  function_response = types.Content(
+      role='user',
+      parts=[
+          types.Part.from_function_response(
+              name='lookup', response={'result': 'done'}
+          )
+      ],
+  )
+  request = LlmRequest(
+      contents=[
+          types.UserContent('current query'),
+          types.ModelContent(
+              types.Part.from_function_call(name='lookup', args={})
+          ),
+          function_response,
+      ]
+  )
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=_tool_context(_memory('likes tea')),
+      llm_request=request,
+  )
+
+  assert request.contents[-2] is function_response
+  assert 'likes tea' in request.contents[-1].parts[0].text
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_does_not_change_cacheable_prefix_fingerprint():
+  """Different recalled memories keep the same prefix fingerprint."""
+  requests = []
+  for memory_text in ('likes tea', 'likes coffee'):
+    request = LlmRequest(
+        model='gemini-2.5-flash',
+        contents=[
+            types.UserContent('historical question'),
+            types.ModelContent('historical answer'),
+            types.UserContent('current query'),
+        ],
+    )
+    request.config.system_instruction = 'stable instruction'
+    await PreloadMemoryTool().process_llm_request(
+        tool_context=_tool_context(_memory(memory_text)),
+        llm_request=request,
+    )
+    requests.append(request)
+
+  client = mock.Mock(vertexai=False)
+  client._api_client = None
+  manager = GeminiContextCacheManager(client)
+  prefix_counts = [
+      manager._find_count_of_contents_to_cache(request.contents)
+      for request in requests
+  ]
+  fingerprints = [
+      manager._generate_cache_fingerprint(request, prefix_count)
+      for request, prefix_count in zip(requests, prefix_counts)
+  ]
+
+  assert prefix_counts == [2, 2]
+  assert fingerprints[0] == fingerprints[1]
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_search_failure_is_noop():
+  """A failing memory search leaves the request completely untouched."""
+  request = LlmRequest(contents=[types.UserContent('current query')])
+  request.config.system_instruction = 'stable instruction'
+  original = request.model_copy(deep=True)
+  tool_context = _tool_context()
+  tool_context.search_memory.side_effect = RuntimeError('unavailable')
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=tool_context,
+      llm_request=request,
+  )
+
+  assert request == original
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_uses_text_from_every_part():
+  """The search query is not limited to the first content part.
+
+  A leading non-text part (e.g. an inline file or a provider-required
+  placeholder) must not blank out or replace the user's actual question.
+  """
+  request = LlmRequest(contents=[types.UserContent('current query')])
+  tool_context = mock.Mock()
+  tool_context.user_content = types.Content(
+      role='user',
+      parts=[
+          types.Part(text=''),
+          types.Part.from_text(text='what tea do I like'),
+      ],
+  )
+  tool_context.search_memory = mock.AsyncMock(
+      return_value=SearchMemoryResponse(memories=[])
+  )
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=tool_context,
+      llm_request=request,
+  )
+
+  tool_context.search_memory.assert_awaited_once_with('what tea do I like')
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_concatenates_multiple_text_parts():
+  """Multiple text parts in user content are concatenated with spaces."""
+  request = LlmRequest(contents=[types.UserContent('hello world')])
+  tool_context = mock.Mock()
+  tool_context.user_content = types.Content(
+      role='user',
+      parts=[
+          types.Part.from_text(text='hello'),
+          types.Part.from_text(text='world'),
+      ],
+  )
+  tool_context.search_memory = mock.AsyncMock(
+      return_value=SearchMemoryResponse(memories=[_memory('likes tea')])
+  )
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=tool_context,
+      llm_request=request,
+  )
+
+  tool_context.search_memory.assert_awaited_once_with('hello world')
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_empty_or_non_text_parts_is_noop():
+  """No non-empty text part means no memory search."""
+  request = LlmRequest(contents=[types.UserContent('query')])
+  tool_context = mock.Mock()
+  tool_context.user_content = types.Content(
+      role='user',
+      parts=[
+          types.Part.from_text(text=''),
+          types.Part.from_bytes(data=b'data', mime_type='image/png'),
+      ],
+  )
+  tool_context.search_memory = mock.AsyncMock()
+
+  await PreloadMemoryTool().process_llm_request(
+      tool_context=tool_context,
+      llm_request=request,
+  )
+
+  tool_context.search_memory.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preload_memory_logs_search_failure_on_own_logger(caplog):
+  """Retrieval failures must be observable via the module's own logger.
+
+  Applications that configure logging by the `google_adk` namespace would
+  otherwise never see a memory backend outage, since a fail-open retrieval
+  error is indistinguishable from "no memories matched".
+  """
+  request = LlmRequest(contents=[types.UserContent('current query')])
+  tool_context = _tool_context()
+  tool_context.search_memory.side_effect = RuntimeError('unavailable')
+
+  with caplog.at_level(logging.WARNING, logger='google_adk'):
+    await PreloadMemoryTool().process_llm_request(
+        tool_context=tool_context,
+        llm_request=request,
+    )
+
+  warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+  assert len(warnings) == 1
+  assert warnings[0].name == 'google_adk.google.adk.tools.preload_memory_tool'
+  assert warnings[0].exc_info is not None
+  assert 'current query' not in caplog.text

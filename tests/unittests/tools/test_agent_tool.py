@@ -1,0 +1,2725 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+import contextlib
+import json
+from typing import Any
+from typing import Optional
+from unittest.mock import patch
+
+from google.adk.agents.base_agent import BaseAgent
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.agents.invocation_context import InvocationContext
+from google.adk.agents.llm_agent import Agent
+from google.adk.agents.llm_agent import LlmAgent
+from google.adk.agents.run_config import RunConfig
+from google.adk.agents.run_config import StreamingMode
+from google.adk.agents.sequential_agent import SequentialAgent
+from google.adk.artifacts.in_memory_artifact_service import InMemoryArtifactService
+from google.adk.events.event import Event
+from google.adk.features import FeatureName
+from google.adk.features._feature_registry import temporary_feature_override
+from google.adk.flows.llm_flows.tools._thread_pool import _call_tool_in_thread_pool
+from google.adk.memory.in_memory_memory_service import InMemoryMemoryService
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
+from google.adk.plugins.base_plugin import BasePlugin
+from google.adk.plugins.plugin_manager import PluginManager
+from google.adk.runners import Runner
+import google.adk.runners as _runners_module
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
+from google.adk.tools.agent_tool import AgentTool
+from google.adk.tools.function_tool import FunctionTool
+from google.adk.tools.tool_configs import ToolArgsConfig
+from google.adk.tools.tool_context import ToolContext
+from google.adk.utils._schema_utils import validate_node_data
+from google.adk.utils.variant_utils import GoogleLLMVariant
+from google.adk.workflow._function_node import FunctionNode
+from google.genai import types
+from google.genai.types import Part
+from pydantic import BaseModel
+import pytest
+from pytest import mark
+
+from .. import testing_utils
+
+function_call_custom = Part.from_function_call(
+    name='tool_agent', args={'custom_input': 'test1'}
+)
+
+function_call_no_schema = Part.from_function_call(
+    name='tool_agent', args={'request': 'test1'}
+)
+
+function_response_custom = Part.from_function_response(
+    name='tool_agent', response={'custom_output': 'response1'}
+)
+
+function_response_no_schema = Part.from_function_response(
+    name='tool_agent', response={'result': 'response1'}
+)
+
+
+def change_state_callback(callback_context: CallbackContext):
+  callback_context.state['state_1'] = 'changed_value'
+  print('change_state_callback: ', callback_context.state)
+
+
+@mark.asyncio
+async def test_agent_tool_inherits_parent_app_name(monkeypatch):
+  parent_app_name = 'parent_app'
+  captured: dict[str, str] = {}
+
+  class RecordingSessionService(InMemorySessionService):
+
+    async def create_session(
+        self,
+        *,
+        app_name: str,
+        user_id: str,
+        state: Optional[dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ):
+      captured['session_app_name'] = app_name
+      return await super().create_session(
+          app_name=app_name,
+          user_id=user_id,
+          state=state,
+          session_id=session_id,
+      )
+
+  monkeypatch.setattr(
+      'google.adk.sessions.in_memory_session_service.InMemorySessionService',
+      RecordingSessionService,
+  )
+
+  async def _empty_async_generator():
+    if False:
+      yield None
+
+  class StubRunner:
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        agent: Agent,
+        artifact_service,
+        session_service,
+        memory_service,
+        credential_service,
+        plugins,
+    ):
+      del artifact_service, memory_service, credential_service
+      captured['runner_app_name'] = app_name
+      self.agent = agent
+      self.session_service = session_service
+      self.plugin_manager = PluginManager(plugins=plugins)
+      self.app_name = app_name
+
+    def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: Optional[str] = None,
+        new_message: Optional[types.Content] = None,
+        state_delta: Optional[dict[str, Any]] = None,
+        run_config: Optional[RunConfig] = None,
+        yield_user_message: bool = False,
+        abort_signal: Optional[asyncio.Event] = None,
+        **kwargs,
+    ):
+      del (
+          user_id,
+          session_id,
+          invocation_id,
+          new_message,
+          state_delta,
+          run_config,
+          yield_user_message,
+          abort_signal,
+          kwargs,
+      )
+      return _empty_async_generator()
+
+    async def close(self):
+      """Mock close method."""
+      pass
+
+  monkeypatch.setattr('google.adk.runners.Runner', StubRunner)
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model='test-model',
+  )
+  agent_tool = AgentTool(agent=tool_agent)
+  root_agent = Agent(
+      name='root_agent',
+      model='test-model',
+      tools=[agent_tool],
+  )
+
+  artifact_service = InMemoryArtifactService()
+  parent_session_service = InMemorySessionService()
+  parent_session = await parent_session_service.create_session(
+      app_name=parent_app_name,
+      user_id='user',
+  )
+  invocation_context = InvocationContext(
+      artifact_service=artifact_service,
+      session_service=parent_session_service,
+      memory_service=InMemoryMemoryService(),
+      plugin_manager=PluginManager(),
+      invocation_id='invocation-id',
+      agent=root_agent,
+      session=parent_session,
+      run_config=RunConfig(),
+  )
+  tool_context = ToolContext(invocation_context)
+
+  assert tool_context._invocation_context.app_name == parent_app_name
+
+  await agent_tool.run_async(
+      args={'request': 'hello'},
+      tool_context=tool_context,
+  )
+
+  assert captured['runner_app_name'] == parent_app_name
+  assert captured['session_app_name'] == parent_app_name
+
+
+async def _capture_nested_run_config(
+    monkeypatch, parent_run_config: RunConfig
+) -> RunConfig:
+  """Returns the RunConfig an AgentTool hands to the Runner it starts."""
+  captured: dict[str, Any] = {}
+
+  async def _empty_async_generator():
+    if False:
+      yield None
+
+  class StubRunner:
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        agent: Agent,
+        artifact_service,
+        session_service,
+        memory_service,
+        credential_service,
+        plugins,
+    ):
+      del app_name, artifact_service, memory_service, credential_service
+      self.agent = agent
+      self.session_service = session_service
+      self.plugin_manager = PluginManager(plugins=plugins)
+
+    def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: Optional[str] = None,
+        new_message: Optional[types.Content] = None,
+        state_delta: Optional[dict[str, Any]] = None,
+        run_config: Optional[RunConfig] = None,
+        yield_user_message: bool = False,
+        abort_signal: Optional[asyncio.Event] = None,
+        **kwargs,
+    ):
+      del (
+          user_id,
+          session_id,
+          invocation_id,
+          new_message,
+          state_delta,
+          yield_user_message,
+          abort_signal,
+          kwargs,
+      )
+      captured['run_config'] = run_config
+      return _empty_async_generator()
+
+    async def close(self):
+      pass
+
+  monkeypatch.setattr('google.adk.runners.Runner', StubRunner)
+
+  tool_agent = Agent(name='tool_agent', model='test-model')
+  agent_tool = AgentTool(agent=tool_agent)
+  root_agent = Agent(name='root_agent', model='test-model', tools=[agent_tool])
+
+  parent_session_service = InMemorySessionService()
+  parent_session = await parent_session_service.create_session(
+      app_name='parent_app',
+      user_id='user',
+  )
+  invocation_context = InvocationContext(
+      artifact_service=InMemoryArtifactService(),
+      session_service=parent_session_service,
+      memory_service=InMemoryMemoryService(),
+      plugin_manager=PluginManager(),
+      invocation_id='invocation-id',
+      agent=root_agent,
+      session=parent_session,
+      run_config=parent_run_config,
+  )
+
+  await agent_tool.run_async(
+      args={'request': 'hello'},
+      tool_context=ToolContext(invocation_context),
+  )
+
+  return captured['run_config']
+
+
+@mark.asyncio
+async def test_agent_tool_forwards_parent_run_config(monkeypatch):
+  parent_run_config = RunConfig(max_llm_calls=7, custom_metadata={'tier': 'x'})
+
+  nested_run_config = await _capture_nested_run_config(
+      monkeypatch, parent_run_config
+  )
+
+  assert nested_run_config is parent_run_config
+  assert nested_run_config.max_llm_calls == 7
+  assert nested_run_config.custom_metadata == {'tier': 'x'}
+
+
+@mark.asyncio
+async def test_agent_tool_does_not_forward_support_cfc(monkeypatch):
+  """CFC describes the caller's own model, not the agent it wraps as a tool."""
+  parent_run_config = RunConfig(support_cfc=True, max_llm_calls=7)
+
+  nested_run_config = await _capture_nested_run_config(
+      monkeypatch, parent_run_config
+  )
+
+  assert nested_run_config.support_cfc is False
+  assert nested_run_config.max_llm_calls == 7
+  assert parent_run_config.support_cfc is True
+
+
+@mark.asyncio
+async def test_agent_tool_forces_unary_nested_run(monkeypatch):
+  """The response is read from the last event, so the nested run must be unary."""
+  parent_run_config = RunConfig(
+      streaming_mode=StreamingMode.SSE, max_llm_calls=7
+  )
+
+  nested_run_config = await _capture_nested_run_config(
+      monkeypatch, parent_run_config
+  )
+
+  assert nested_run_config.streaming_mode == StreamingMode.NONE
+  # Other settings are still forwarded, and the caller is left untouched.
+  assert nested_run_config.max_llm_calls == 7
+  assert parent_run_config.streaming_mode == StreamingMode.SSE
+
+
+@mark.asyncio
+async def test_agent_tool_keeps_unary_run_unchanged(monkeypatch):
+  """A caller already running unary is forwarded unchanged."""
+  parent_run_config = RunConfig(streaming_mode=StreamingMode.NONE)
+
+  nested_run_config = await _capture_nested_run_config(
+      monkeypatch, parent_run_config
+  )
+
+  assert nested_run_config.streaming_mode == StreamingMode.NONE
+
+
+async def test_agent_tool_forwards_parent_abort_signal(monkeypatch):
+  """Parent invocation's abort_signal is forwarded to child Runner.run_async."""
+  captured: dict[str, Any] = {}
+
+  async def _empty_async_generator():
+    if False:
+      yield None
+
+  class StubRunner:
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        agent: Agent,
+        artifact_service,
+        session_service,
+        memory_service,
+        credential_service,
+        plugins,
+    ):
+      del app_name, artifact_service, memory_service, credential_service
+      self.agent = agent
+      self.session_service = session_service
+      self.plugin_manager = PluginManager(plugins=plugins)
+
+    def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id: Optional[str] = None,
+        new_message: Optional[types.Content] = None,
+        state_delta: Optional[dict[str, Any]] = None,
+        run_config: Optional[RunConfig] = None,
+        yield_user_message: bool = False,
+        abort_signal: Optional[asyncio.Event] = None,
+        **kwargs,
+    ):
+      del (
+          user_id,
+          session_id,
+          invocation_id,
+          new_message,
+          state_delta,
+          run_config,
+          yield_user_message,
+          kwargs,
+      )
+      captured['abort_signal'] = abort_signal
+      return _empty_async_generator()
+
+    async def close(self):
+      pass
+
+  monkeypatch.setattr('google.adk.runners.Runner', StubRunner)
+
+  tool_agent = Agent(name='tool_agent', model='test-model')
+  agent_tool = AgentTool(agent=tool_agent)
+  root_agent = Agent(name='root_agent', model='test-model', tools=[agent_tool])
+
+  parent_session_service = InMemorySessionService()
+  parent_session = await parent_session_service.create_session(
+      app_name='parent_app',
+      user_id='user',
+  )
+  invocation_context = InvocationContext(
+      artifact_service=InMemoryArtifactService(),
+      session_service=parent_session_service,
+      memory_service=InMemoryMemoryService(),
+      plugin_manager=PluginManager(),
+      invocation_id='invocation-id',
+      agent=root_agent,
+      session=parent_session,
+  )
+  parent_signal = asyncio.Event()
+  invocation_context._attach_abort_signal(parent_signal)
+
+  await agent_tool.run_async(
+      args={'request': 'hello'},
+      tool_context=ToolContext(invocation_context),
+  )
+
+  assert captured['abort_signal'] is parent_signal
+
+
+def test_no_schema():
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          function_call_no_schema,
+          'response1',
+          'response2',
+      ]
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+
+  assert testing_utils.simplify_events(runner.run('test1')) == [
+      ('root_agent', function_call_no_schema),
+      ('root_agent', function_response_no_schema),
+      ('root_agent', 'response2'),
+  ]
+
+
+def test_use_plugins():
+  """The agent tool can use plugins from parent runner."""
+
+  class ModelResponseCapturePlugin(BasePlugin):
+
+    def __init__(self):
+      super().__init__('plugin')
+      self.model_responses = {}
+
+    async def after_model_callback(
+        self,
+        *,
+        callback_context: CallbackContext,
+        llm_response: LlmResponse,
+    ) -> Optional[LlmResponse]:
+      response_text = []
+      for part in llm_response.content.parts:
+        if not part.text:
+          continue
+        response_text.append(part.text)
+      if response_text:
+        if callback_context.agent_name not in self.model_responses:
+          self.model_responses[callback_context.agent_name] = []
+        self.model_responses[callback_context.agent_name].append(
+            ''.join(response_text)
+        )
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          function_call_no_schema,
+          'response1',
+          'response2',
+      ]
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent)],
+  )
+
+  model_response_capture = ModelResponseCapturePlugin()
+  runner = testing_utils.InMemoryRunner(
+      root_agent, plugins=[model_response_capture]
+  )
+
+  assert testing_utils.simplify_events(runner.run('test1')) == [
+      ('root_agent', function_call_no_schema),
+      ('root_agent', function_response_no_schema),
+      ('root_agent', 'response2'),
+  ]
+
+  # should be able to capture response from both root and tool agent.
+  assert model_response_capture.model_responses == {
+      'tool_agent': ['response1'],
+      'root_agent': ['response2'],
+  }
+
+
+def test_update_state():
+  """The agent tool can read and change parent state."""
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          function_call_no_schema,
+          '{"custom_output": "response1"}',
+          'response2',
+      ]
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+      instruction='input: {state_1}',
+      before_agent_callback=change_state_callback,
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  runner.session.state['state_1'] = 'state1_value'
+
+  runner.run('test1')
+  assert (
+      'input: changed_value' in mock_model.requests[1].config.system_instruction
+  )
+  assert runner.session.state['state_1'] == 'changed_value'
+
+
+@mark.parametrize(
+    'reader',
+    [
+        'instruction',
+        'optional_instruction',
+        'callback',
+        'tool',
+        'sequential_agent',
+        'input_schema',
+    ],
+)
+def test_agent_tool_reads_caller_temp_state(reader):
+  """The wrapped agent reads the caller's temp: state, but not adk's own."""
+
+  class _NotJsonSerializable:
+    """A value only temp: state can hold, since it is never persisted."""
+
+  class TicketInput(BaseModel):
+    custom_input: str
+
+  client = _NotJsonSerializable()
+  seen = {}
+  keys = ('temp:ticket', 'temp:client', 'plain', 'temp:_adk_internal')
+
+  def set_caller_state(callback_context: CallbackContext):
+    callback_context.state['temp:ticket'] = 'T-42'
+    callback_context.state['temp:client'] = client
+    callback_context.state['plain'] = 'P'
+    callback_context.state['temp:_adk_internal'] = 'X'
+
+  def read_in_callback(callback_context: CallbackContext):
+    for key in keys:
+      seen[key] = callback_context.state.get(key)
+
+  def read_in_tool(tool_context: ToolContext) -> str:
+    for key in keys:
+      seen[key] = tool_context.state.get(key)
+    return 'read'
+
+  template = 'ticket: {temp:ticket} plain: {plain}'
+  tool_call = (
+      function_call_custom
+      if reader == 'input_schema'
+      else function_call_no_schema
+  )
+  responses = ['response1', 'response2']
+  if reader == 'tool':
+    responses.insert(0, Part.from_function_call(name='read_in_tool', args={}))
+  mock_model = testing_utils.MockModel.create(responses=[tool_call, *responses])
+  if reader == 'sequential_agent':
+    tool_agent = SequentialAgent(
+        name='tool_agent',
+        sub_agents=[
+            Agent(name='inner_agent', model=mock_model, instruction=template)
+        ],
+    )
+  elif reader == 'input_schema':
+    tool_agent = Agent(
+        name='tool_agent',
+        model=mock_model,
+        input_schema=TicketInput,
+        instruction=template,
+    )
+  else:
+    tool_agent = Agent(
+        name='tool_agent',
+        model=mock_model,
+        instruction={
+            'instruction': template,
+            'optional_instruction': 'ticket: {temp:ticket?} plain: {plain?}',
+        }.get(reader, 'no template'),
+        before_agent_callback=(
+            read_in_callback if reader == 'callback' else None
+        ),
+        tools=[read_in_tool] if reader == 'tool' else [],
+    )
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      before_agent_callback=set_caller_state,
+      tools=[AgentTool(agent=tool_agent)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  runner.run('test1')
+
+  if reader in ('callback', 'tool'):
+    assert seen['temp:ticket'] == 'T-42'
+    assert seen['temp:client'] is client
+    assert seen['plain'] == 'P'
+    assert seen['temp:_adk_internal'] is None
+  else:
+    assert mock_model.requests[1].config.system_instruction.startswith(
+        'ticket: T-42 plain: P'
+    )
+
+
+def test_agent_tool_temp_state_is_not_copied_back_to_caller():
+  """temp: state the wrapped agent edits or writes stays in the nested run."""
+  child_parts = []
+
+  def set_caller_state(callback_context: CallbackContext):
+    callback_context.state['temp:ticket'] = 'T-42'
+    callback_context.state['temp:parts'] = []
+
+  def edit_temp_state(tool_context: ToolContext) -> str:
+    tool_context.state['temp:parts'] += ['child_part']
+    tool_context.state['temp:ticket'] = 'changed'
+    child_parts.append(list(tool_context.state['temp:parts']))
+    return 'edited'
+
+  caller_deltas = []
+  caller_parts = []
+
+  def record_caller_state(tool, args, tool_context, tool_response):
+    caller_deltas.append(dict(tool_context.actions.state_delta))
+    caller_parts.append(tool_context.state.get('temp:parts'))
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          function_call_no_schema,
+          Part.from_function_call(name='edit_temp_state', args={}),
+          'response1',
+          'response2',
+      ]
+  )
+  tool_agent = Agent(
+      name='tool_agent', model=mock_model, tools=[edit_temp_state]
+  )
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      before_agent_callback=set_caller_state,
+      after_tool_callback=record_caller_state,
+      tools=[AgentTool(agent=tool_agent)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  runner.run('test1')
+
+  assert child_parts == [['child_part']]
+  assert len(caller_deltas) == 1
+  assert not any(key.startswith('temp:') for key in caller_deltas[0])
+  assert caller_parts == [[]]
+
+
+@mark.asyncio
+async def test_update_artifacts():
+  """The agent tool can read and write artifacts."""
+
+  async def before_tool_agent(callback_context: CallbackContext):
+    # Artifact 1 should be available in the tool agent.
+    artifact = await callback_context.load_artifact('artifact_1')
+    await callback_context.save_artifact(
+        'artifact_2', Part.from_text(text=artifact.text + ' 2')
+    )
+
+  tool_agent = SequentialAgent(
+      name='tool_agent',
+      before_agent_callback=before_tool_agent,
+  )
+
+  async def before_main_agent(callback_context: CallbackContext):
+    await callback_context.save_artifact(
+        'artifact_1', Part.from_text(text='test')
+    )
+
+  async def after_main_agent(callback_context: CallbackContext):
+    # Artifact 2 should be available after the tool agent.
+    artifact_2 = await callback_context.load_artifact('artifact_2')
+    await callback_context.save_artifact(
+        'artifact_3', Part.from_text(text=artifact_2.text + ' 3')
+    )
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'response2']
+  )
+  root_agent = Agent(
+      name='root_agent',
+      before_agent_callback=before_main_agent,
+      after_agent_callback=after_main_agent,
+      tools=[AgentTool(agent=tool_agent)],
+      model=mock_model,
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  runner.run('test1')
+
+  async def load_artifact(filename: str):
+    return await runner.runner.artifact_service.load_artifact(
+        app_name='test_app',
+        user_id='test_user',
+        session_id=runner.session_id,
+        filename=filename,
+    )
+
+  assert await runner.runner.artifact_service.list_artifact_keys(
+      app_name='test_app', user_id='test_user', session_id=runner.session_id
+  ) == ['artifact_1', 'artifact_2', 'artifact_3']
+
+  assert await load_artifact('artifact_1') == Part.from_text(text='test')
+  assert await load_artifact('artifact_2') == Part.from_text(text='test 2')
+  assert await load_artifact('artifact_3') == Part.from_text(text='test 2 3')
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'GOOGLE_AI',
+        # TODO: re-enable after fix.
+        # 'VERTEX',
+    ],
+    indirect=True,
+)
+def test_custom_schema(env_variables):
+  class CustomInput(BaseModel):
+    custom_input: str
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          function_call_custom,
+          '{"custom_output": "response1"}',
+          'response2',
+      ]
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+      input_schema=CustomInput,
+      output_schema=CustomOutput,
+      output_key='tool_output',
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  runner.session.state['state_1'] = 'state1_value'
+
+  assert testing_utils.simplify_events(runner.run('test1')) == [
+      ('root_agent', function_call_custom),
+      ('root_agent', function_response_custom),
+      ('root_agent', 'response2'),
+  ]
+
+  assert runner.session.state['tool_output'] == {'custom_output': 'response1'}
+
+  assert len(mock_model.requests) == 3
+  # The second request is the tool agent request.
+  assert mock_model.requests[1].config.response_schema == CustomOutput
+  assert mock_model.requests[1].config.response_mime_type == 'application/json'
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_schema_no_output_schema_vertex_ai(
+    env_variables,
+):
+  """Test AgentTool with no output schema has string response schema for VERTEX_AI."""
+  tool_agent = Agent(
+      name='tool_agent',
+      model=testing_utils.MockModel.create(responses=['test response']),
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.name == 'tool_agent'
+
+  from google.adk.features import is_feature_enabled
+
+  if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+    assert declaration.parameters_json_schema == {
+        'type': 'object',
+        'properties': {'request': {'type': 'string'}},
+        'required': ['request'],
+    }
+    assert declaration.response_json_schema == {'type': 'string'}
+  else:
+    assert declaration.parameters.type == 'OBJECT'
+    assert declaration.parameters.properties['request'].type == 'STRING'
+    assert declaration.response is not None
+    assert declaration.response.type == types.Type.STRING
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_schema_with_output_schema_vertex_ai(
+    env_variables,
+):
+  """Test AgentTool with output schema has object response schema for VERTEX_AI."""
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      output_schema=CustomOutput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.name == 'tool_agent'
+  # Should have object response schema for VERTEX_AI when output_schema exists
+  from google.adk.features import is_feature_enabled
+
+  if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+    assert declaration.response_json_schema == {'type': 'object'}
+  else:
+    assert declaration.response is not None
+    assert declaration.response.type == types.Type.OBJECT
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'GOOGLE_AI',  # Test GEMINI_API variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_schema_gemini_api(
+    env_variables,
+):
+  """Test AgentTool with GEMINI_API variant has no response schema."""
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      output_schema=CustomOutput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.name == 'tool_agent'
+  # GEMINI_API should not have response schema
+  assert declaration.response is None
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_schema_with_input_schema_vertex_ai(
+    env_variables,
+):
+  """Test AgentTool with input and output schemas for VERTEX_AI."""
+
+  class CustomInput(BaseModel):
+    custom_input: str
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      input_schema=CustomInput,
+      output_schema=CustomOutput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.name == 'tool_agent'
+  from google.adk.features import is_feature_enabled
+
+  if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+    assert declaration.parameters_json_schema == {
+        'title': 'CustomInput',
+        'type': 'object',
+        'properties': {
+            'custom_input': {'title': 'Custom Input', 'type': 'string'}
+        },
+        'required': ['custom_input'],
+    }
+    assert declaration.response_json_schema == {'type': 'object'}
+  else:
+    assert declaration.parameters.type == 'OBJECT'
+    assert declaration.parameters.properties['custom_input'].type == 'STRING'
+    # Should have object response schema for VERTEX_AI when output_schema exists
+    assert declaration.response is not None
+    assert declaration.response.type == types.Type.OBJECT
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_schema_with_input_schema_no_output_vertex_ai(
+    env_variables,
+):
+  """Test AgentTool with input schema but no output schema for VERTEX_AI."""
+
+  class CustomInput(BaseModel):
+    custom_input: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      input_schema=CustomInput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.name == 'tool_agent'
+  from google.adk.features import is_feature_enabled
+
+  if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+    assert declaration.parameters_json_schema == {
+        'title': 'CustomInput',
+        'type': 'object',
+        'properties': {
+            'custom_input': {'title': 'Custom Input', 'type': 'string'}
+        },
+        'required': ['custom_input'],
+    }
+    assert declaration.response_json_schema == {'type': 'string'}
+  else:
+    assert declaration.parameters.type == 'OBJECT'
+    assert declaration.parameters.properties['custom_input'].type == 'STRING'
+    # Should have string response schema for VERTEX_AI when no output_schema
+    assert declaration.response is not None
+    assert declaration.response.type == types.Type.STRING
+
+
+def test_include_plugins_default_true():
+  """Test that plugins are propagated by default (include_plugins=True)."""
+
+  # Create a test plugin that tracks callbacks
+  class TrackingPlugin(BasePlugin):
+
+    def __init__(self, name: str):
+      super().__init__(name)
+      self.before_agent_calls = 0
+
+    async def before_agent_callback(self, **kwargs):
+      self.before_agent_calls += 1
+
+  tracking_plugin = TrackingPlugin(name='tracking')
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'response1', 'response2']
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent)],  # Default include_plugins=True
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent, plugins=[tracking_plugin])
+  runner.run('test1')
+
+  # Plugin should be called for both root_agent and tool_agent.
+  assert tracking_plugin.before_agent_calls == 2
+
+
+def test_include_plugins_explicit_true():
+  """Test that plugins are propagated when include_plugins=True."""
+
+  class TrackingPlugin(BasePlugin):
+
+    def __init__(self, name: str):
+      super().__init__(name)
+      self.before_agent_calls = 0
+
+    async def before_agent_callback(self, **kwargs):
+      self.before_agent_calls += 1
+
+  tracking_plugin = TrackingPlugin(name='tracking')
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'response1', 'response2']
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent, include_plugins=True)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent, plugins=[tracking_plugin])
+  runner.run('test1')
+
+  # Plugin should be called for both root_agent and tool_agent.
+  assert tracking_plugin.before_agent_calls == 2
+
+
+def test_include_plugins_false():
+  """Test that plugins are NOT propagated when include_plugins=False."""
+
+  class TrackingPlugin(BasePlugin):
+
+    def __init__(self, name: str):
+      super().__init__(name)
+      self.before_agent_calls = 0
+
+    async def before_agent_callback(self, **kwargs):
+      self.before_agent_calls += 1
+
+  tracking_plugin = TrackingPlugin(name='tracking')
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'response1', 'response2']
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=mock_model,
+  )
+
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent, include_plugins=False)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent, plugins=[tracking_plugin])
+  runner.run('test1')
+
+  # Plugin should only be called for root_agent, not tool_agent.
+  assert tracking_plugin.before_agent_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_include_plugins_true_sub_runner_does_not_close_parent_plugins():
+  """Sub-Runner must not close plugins owned by the parent runner."""
+
+  class SlowClosePlugin(BasePlugin):
+
+    def __init__(self, name: str):
+      super().__init__(name)
+      self.close_calls = 0
+
+    async def close(self):
+      self.close_calls += 1
+      # Would otherwise blow past the sub-Runner's plugin_close_timeout.
+      await asyncio.sleep(10)
+
+  parent_plugin = SlowClosePlugin(name='parent_plugin')
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'response1', 'response2']
+  )
+
+  tool_agent = Agent(name='tool_agent', model=mock_model)
+  root_agent = Agent(
+      name='root_agent',
+      model=mock_model,
+      tools=[AgentTool(agent=tool_agent, include_plugins=True)],
+  )
+
+  runner = Runner(
+      app_name='test_app',
+      agent=root_agent,
+      artifact_service=InMemoryArtifactService(),
+      session_service=InMemorySessionService(),
+      memory_service=InMemoryMemoryService(),
+      plugins=[parent_plugin],
+      # Tight timeout amplifies the bug if it regresses; with the fix, the
+      # sub-Runner's close skips the parent's plugins entirely.
+      plugin_close_timeout=0.01,
+  )
+  session = await runner.session_service.create_session(
+      app_name='test_app', user_id='test_user'
+  )
+  # Must not raise RuntimeError("Failed to close plugins: ...") from the
+  # sub-Runner closing the parent's slow-to-close plugin.
+  async for _ in runner.run_async(
+      user_id=session.user_id,
+      session_id=session.id,
+      new_message=testing_utils.get_user_content('test1'),
+  ):
+    pass
+
+  # The sub-Runner must not have closed the parent's plugin.
+  assert parent_plugin.close_calls == 0
+
+
+def test_agent_tool_description_with_input_schema():
+  """Test that agent description is propagated when using input_schema."""
+
+  class CustomInput(BaseModel):
+    """This is the Pydantic model docstring."""
+
+    custom_input: str
+
+  agent_description = 'This is the agent description that should be used'
+  tool_agent = Agent(
+      name='tool_agent',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      description=agent_description,
+      input_schema=CustomInput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  # The description should come from the agent, not the Pydantic model
+  assert declaration.description == agent_description
+
+
+@pytest.fixture
+def enable_json_schema_feature():
+  """Fixture to enable JSON_SCHEMA_FOR_FUNC_DECL feature for a test."""
+  with temporary_feature_override(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL, True):
+    yield
+
+
+def test_agent_tool_no_schema_with_json_schema_feature(
+    enable_json_schema_feature,
+):
+  """Test AgentTool without input_schema uses parameters_json_schema when feature enabled."""
+  tool_agent = Agent(
+      name='tool_agent',
+      description='A tool agent for testing.',
+      model=testing_utils.MockModel.create(responses=['test response']),
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.model_dump(exclude_none=True) == {
+      'name': 'tool_agent',
+      'description': 'A tool agent for testing.',
+      'parameters_json_schema': {
+          'type': 'object',
+          'properties': {
+              'request': {'type': 'string'},
+          },
+          'required': ['request'],
+      },
+  }
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_json_schema_no_output_schema_vertex_ai(
+    env_variables,
+    enable_json_schema_feature,
+):
+  """Test AgentTool with no output schema uses response_json_schema for VERTEX_AI when feature enabled."""
+  tool_agent = Agent(
+      name='tool_agent',
+      description='A tool agent for testing.',
+      model=testing_utils.MockModel.create(responses=['test response']),
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.model_dump(exclude_none=True) == {
+      'name': 'tool_agent',
+      'description': 'A tool agent for testing.',
+      'parameters_json_schema': {
+          'type': 'object',
+          'properties': {
+              'request': {'type': 'string'},
+          },
+          'required': ['request'],
+      },
+      'response_json_schema': {'type': 'string'},
+  }
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_response_json_schema_with_output_schema_vertex_ai(
+    env_variables,
+    enable_json_schema_feature,
+):
+  """Test AgentTool with output schema uses response_json_schema for VERTEX_AI when feature enabled."""
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      description='A tool agent for testing.',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      output_schema=CustomOutput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  assert declaration.model_dump(exclude_none=True) == {
+      'name': 'tool_agent',
+      'description': 'A tool agent for testing.',
+      'parameters_json_schema': {
+          'type': 'object',
+          'properties': {
+              'request': {'type': 'string'},
+          },
+          'required': ['request'],
+      },
+      'response_json_schema': {'type': 'object'},
+  }
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'GOOGLE_AI',  # Test GEMINI_API variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_no_response_json_schema_gemini_api(
+    env_variables,
+    enable_json_schema_feature,
+):
+  """Test AgentTool with GEMINI_API variant has no response_json_schema when feature enabled."""
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      description='A tool agent for testing.',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      output_schema=CustomOutput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  # GEMINI_API should not have response_json_schema
+  assert declaration.model_dump(exclude_none=True) == {
+      'name': 'tool_agent',
+      'description': 'A tool agent for testing.',
+      'parameters_json_schema': {
+          'type': 'object',
+          'properties': {
+              'request': {'type': 'string'},
+          },
+          'required': ['request'],
+      },
+  }
+
+
+@mark.parametrize(
+    'env_variables',
+    [
+        'VERTEX',  # Test VERTEX_AI variant
+    ],
+    indirect=True,
+)
+def test_agent_tool_with_input_schema_uses_json_schema_feature(
+    env_variables,
+    enable_json_schema_feature,
+):
+  """Test AgentTool with input_schema uses parameters_json_schema when feature enabled."""
+
+  class CustomInput(BaseModel):
+    custom_input: str
+
+  class CustomOutput(BaseModel):
+    custom_output: str
+
+  tool_agent = Agent(
+      name='tool_agent',
+      description='A tool agent for testing.',
+      model=testing_utils.MockModel.create(responses=['test response']),
+      input_schema=CustomInput,
+      output_schema=CustomOutput,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+  declaration = agent_tool._get_declaration()
+
+  # When input_schema is provided, build_function_declaration uses Pydantic's
+  # model_json_schema() which includes additional fields like 'title'
+  assert declaration.model_dump(exclude_none=True) == {
+      'name': 'tool_agent',
+      'description': 'A tool agent for testing.',
+      'parameters_json_schema': {
+          'properties': {
+              'custom_input': {'title': 'Custom Input', 'type': 'string'},
+          },
+          'required': ['custom_input'],
+          'title': 'CustomInput',
+          'type': 'object',
+      },
+      'response_json_schema': {'type': 'object'},
+  }
+
+
+@mark.asyncio
+async def test_run_async_handles_none_parts_in_response():
+  """Verify run_async handles None parts in response without raising TypeError."""
+
+  # Mock model for the tool_agent that returns content with parts=None
+  # This simulates the condition causing the TypeError
+  tool_agent_model = testing_utils.MockModel.create(
+      responses=[
+          LlmResponse(
+              content=types.Content(parts=None),
+          )
+      ]
+  )
+
+  tool_agent = Agent(
+      name='tool_agent',
+      model=tool_agent_model,
+  )
+
+  agent_tool = AgentTool(agent=tool_agent)
+
+  session_service = InMemorySessionService()
+  session = await session_service.create_session(
+      app_name='test_app', user_id='test_user'
+  )
+
+  invocation_context = InvocationContext(
+      invocation_id='invocation_id',
+      agent=tool_agent,
+      session=session,
+      session_service=session_service,
+  )
+  tool_context = ToolContext(invocation_context=invocation_context)
+
+  # This should not raise `TypeError: 'NoneType' object is not iterable`.
+  tool_result = await agent_tool.run_async(
+      args={'request': 'test request'}, tool_context=tool_context
+  )
+
+  assert tool_result == ''
+
+
+async def _run_agent_tool_with_parts(parts: list[types.Part]) -> Any:
+  """Drives AgentTool with an inner agent whose final event content is `parts`."""
+
+  class _StaticAgent(BaseAgent):
+
+    async def _run_async_impl(self, ctx):
+      yield Event(
+          invocation_id=ctx.invocation_id,
+          author=self.name,
+          content=types.Content(role='model', parts=parts),
+      )
+
+  inner = _StaticAgent(name='inner_agent', description='static')
+  agent_tool = AgentTool(agent=inner)
+
+  session_service = InMemorySessionService()
+  session = await session_service.create_session(
+      app_name='test_app', user_id='test_user'
+  )
+  invocation_context = InvocationContext(
+      invocation_id='invocation_id',
+      agent=inner,
+      session=session,
+      session_service=session_service,
+  )
+  tool_context = ToolContext(invocation_context=invocation_context)
+
+  return await agent_tool.run_async(
+      args={'request': 'test request'}, tool_context=tool_context
+  )
+
+
+@mark.asyncio
+async def test_run_async_extracts_text_only():
+  """Plain text parts pass through unchanged."""
+  result = await _run_agent_tool_with_parts([types.Part(text='hello world')])
+  assert result == 'hello world'
+
+
+@mark.asyncio
+async def test_run_async_extracts_code_execution_result_only():
+  """code_execution_result.output and executable_code.code are returned."""
+  result = await _run_agent_tool_with_parts([
+      types.Part(
+          executable_code=types.ExecutableCode(
+              language=types.Language.PYTHON, code='print(2 ** 10)'
+          )
+      ),
+      types.Part(
+          code_execution_result=types.CodeExecutionResult(
+              outcome=types.Outcome.OUTCOME_OK, output='1024\n'
+          )
+      ),
+  ])
+  assert result == 'print(2 ** 10)\n1024'
+
+
+@mark.asyncio
+async def test_run_async_extracts_text_and_code_execution_result():
+  """Mixed text + code parts are concatenated in order."""
+  result = await _run_agent_tool_with_parts([
+      types.Part(text='Here is the answer:'),
+      types.Part(
+          executable_code=types.ExecutableCode(
+              language=types.Language.PYTHON, code='print(2 ** 10)'
+          )
+      ),
+      types.Part(
+          code_execution_result=types.CodeExecutionResult(
+              outcome=types.Outcome.OUTCOME_OK, output='1024\n'
+          )
+      ),
+  ])
+  assert result == 'Here is the answer:\nprint(2 ** 10)\n1024'
+
+
+@mark.asyncio
+async def test_run_async_extracts_executable_code_only():
+  """executable_code.code alone is returned when no result part follows."""
+  result = await _run_agent_tool_with_parts([
+      types.Part(
+          executable_code=types.ExecutableCode(
+              language=types.Language.PYTHON, code='print("hi")'
+          )
+      ),
+  ])
+  assert result == 'print("hi")'
+
+
+@mark.asyncio
+async def test_run_async_skips_thought_parts():
+  """Parts marked thought=True are dropped regardless of kind."""
+  result = await _run_agent_tool_with_parts([
+      types.Part(text='thinking out loud', thought=True),
+      types.Part(
+          code_execution_result=types.CodeExecutionResult(
+              outcome=types.Outcome.OUTCOME_OK, output='42\n'
+          )
+      ),
+  ])
+  assert result == '42'
+
+
+async def _run_agent_tool_with_events(events: list[Event]) -> Any:
+  """Drives AgentTool with an inner agent that yields `events` in order."""
+
+  class _StaticAgent(BaseAgent):
+
+    async def _run_async_impl(self, ctx):
+      for event in events:
+        yield event
+
+  inner = _StaticAgent(name='inner_agent', description='static')
+  agent_tool = AgentTool(agent=inner)
+
+  session_service = InMemorySessionService()
+  session = await session_service.create_session(
+      app_name='test_app', user_id='test_user'
+  )
+  invocation_context = InvocationContext(
+      invocation_id='invocation_id',
+      agent=inner,
+      session=session,
+      session_service=session_service,
+  )
+  tool_context = ToolContext(invocation_context=invocation_context)
+
+  return await agent_tool.run_async(
+      args={'request': 'test request'}, tool_context=tool_context
+  )
+
+
+@mark.asyncio
+async def test_run_async_preserves_error_event_with_no_content():
+  """An error-only event with no content surfaces its error_message."""
+  result = await _run_agent_tool_with_events([
+      Event(author='inner_agent', error_message='A2A request failed: 503'),
+  ])
+  assert result == 'A2A request failed: 503'
+
+
+@mark.asyncio
+async def test_run_async_preserves_error_when_only_thought_parts():
+  """When the final content is all thought parts, the error_message wins."""
+  result = await _run_agent_tool_with_events([
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='model',
+              parts=[types.Part(text='thinking', thought=True)],
+          ),
+      ),
+      Event(author='inner_agent', error_message='A2A request failed: 503'),
+  ])
+  assert result == 'A2A request failed: 503'
+
+
+@mark.asyncio
+async def test_run_async_returns_empty_string_when_only_thought_parts():
+  """All-thought final content with no error_message returns ''."""
+  result = await _run_agent_tool_with_events([
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='model',
+              parts=[types.Part(text='thinking', thought=True)],
+          ),
+      ),
+  ])
+  assert result == ''
+
+
+@mark.asyncio
+@mark.parametrize(
+    'empty_part',
+    [
+        types.Part(executable_code=types.ExecutableCode(code='')),
+        types.Part(code_execution_result=types.CodeExecutionResult(output='')),
+        types.Part(),
+    ],
+)
+async def test_run_async_skips_parts_without_text(empty_part: types.Part):
+  """A part with no text, code or output adds nothing to the result."""
+  result = await _run_agent_tool_with_parts(
+      [empty_part, types.Part(text='after')]
+  )
+  assert result == 'after'
+
+
+@mark.asyncio
+async def test_run_async_reports_error_when_wrapped_agent_pauses() -> None:
+  """A HITL pause (adk_request_confirmation) must not look like a success.
+
+  The nested run's session is thrown away once AgentTool.run_async returns,
+  so a pending long_running_tool_ids call can never be resumed. The caller
+  must see an explicit error instead of {"result": ""}, which would make its
+  model believe the pending action already completed.
+  """
+  result = await _run_agent_tool_with_events([
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='model',
+              parts=[
+                  types.Part(
+                      function_call=types.FunctionCall(
+                          id='adk-123',
+                          name='adk_request_confirmation',
+                          args={},
+                      )
+                  )
+              ],
+          ),
+          long_running_tool_ids={'adk-123'},
+      ),
+  ])
+  assert result == (
+      "Error: agent 'inner_agent' stopped waiting on unresolved"
+      " long-running tool call(s) (pending call ids: ['adk-123']),"
+      ' which AgentTool cannot resume.'
+  )
+
+
+@mark.asyncio
+async def test_run_async_reports_error_when_llm_agent_requires_confirmation(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+  """End-to-end confirmation pause in a wrapped LlmAgent surfaces an error."""
+  called = False
+
+  def delete_item(item_id: str) -> str:
+    nonlocal called
+    called = True
+    return f'deleted {item_id}'
+
+  inner_model = testing_utils.MockModel.create(
+      responses=[
+          Part.from_function_call(name='delete_item', args={'item_id': '42'}),
+      ]
+  )
+  inner_agent = LlmAgent(
+      name='inner_agent',
+      description='Deletes items',
+      model=inner_model,
+      tools=[FunctionTool(delete_item, require_confirmation=True)],
+  )
+  root_model = testing_utils.MockModel.create(
+      responses=[
+          Part.from_function_call(
+              name='inner_agent', args={'request': 'delete 42'}
+          ),
+          Part.from_text(
+              text='Could not delete item because confirmation is required.'
+          ),
+      ]
+  )
+  root_agent = LlmAgent(
+      name='root_agent',
+      model=root_model,
+      tools=[AgentTool(agent=inner_agent, skip_summarization=True)],
+  )
+
+  runner = testing_utils.InMemoryRunner(root_agent)
+  with caplog.at_level('WARNING', logger='google_adk'):
+    events = await runner.run_async('please delete 42')
+
+  assert not called
+  function_responses = [
+      fr
+      for event in events
+      for fr in event.get_function_responses()
+      if fr.name == 'inner_agent'
+  ]
+  assert len(function_responses) == 1
+  assert function_responses[0].response is not None
+  error_text = function_responses[0].response['result']
+  assert error_text.startswith(
+      "Error: agent 'inner_agent' stopped waiting on unresolved"
+      ' long-running tool call(s) (pending call ids: ['
+  )
+  assert events[-1].content and events[-1].content.parts
+  assert events[-1].content.parts[0].text == (
+      'Could not delete item because confirmation is required.'
+  )
+  assert any(
+      "Agent 'inner_agent' paused with unresolved long-running tool call(s)"
+      in record.getMessage()
+      for record in caplog.records
+  )
+
+
+@mark.asyncio
+async def test_run_async_returns_answer_after_long_running_tool_resolves() -> (
+    None
+):
+  """A long-running call answered in the same or a later event is not a pause.
+
+  An ordinary LongRunningFunctionTool that returns a truthy progress value
+  (e.g. {'status': 'pending'}) gets an auto-built function response in the
+  very same turn (see _caller.py), and A2A converters may aggregate both the
+  long-running call and its response onto a single Event. In both cases the
+  call is resolved before the run ends, so AgentTool must return the genuine
+  final answer instead of the error.
+  """
+  result = await _run_agent_tool_with_events([
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='model',
+              parts=[
+                  types.Part(
+                      function_call=types.FunctionCall(
+                          name='slow_tool', args={}, id='adk-123'
+                      )
+                  )
+              ],
+          ),
+          long_running_tool_ids={'adk-123'},
+      ),
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='user',
+              parts=[
+                  types.Part(
+                      function_response=types.FunctionResponse(
+                          name='slow_tool',
+                          response={'status': 'pending'},
+                          id='adk-123',
+                      )
+                  )
+              ],
+          ),
+      ),
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='model',
+              parts=[
+                  types.Part(
+                      function_call=types.FunctionCall(
+                          name='slow_tool', args={}, id='adk-456'
+                      )
+                  ),
+                  types.Part(
+                      function_response=types.FunctionResponse(
+                          name='slow_tool',
+                          response={'status': 'done'},
+                          id='adk-456',
+                      )
+                  ),
+              ],
+          ),
+          long_running_tool_ids={'adk-456'},
+      ),
+      Event(
+          author='inner_agent',
+          content=types.Content(
+              role='model',
+              parts=[types.Part(text='final answer after pending tool')],
+          ),
+      ),
+  ])
+  assert result == 'final answer after pending tool'
+
+
+class TestAgentToolWithCompositeAgents:
+  """Tests for AgentTool wrapping composite agents (SequentialAgent, etc.)."""
+
+  def test_sequential_agent_with_first_sub_agent_input_schema(self):
+    """Test that AgentTool exposes input_schema from first sub-agent of SequentialAgent."""
+
+    class CustomInput(BaseModel):
+      query: str
+      language: str
+
+    first_agent = Agent(
+        name='first_agent',
+        model=testing_utils.MockModel.create(responses=['response1']),
+        input_schema=CustomInput,
+    )
+
+    second_agent = Agent(
+        name='second_agent',
+        model=testing_utils.MockModel.create(responses=['response2']),
+    )
+
+    sequence = SequentialAgent(
+        name='sequence',
+        description='Process the query through multiple steps',
+        sub_agents=[first_agent, second_agent],
+    )
+
+    agent_tool = AgentTool(agent=sequence)
+    declaration = agent_tool._get_declaration()
+
+    # Should expose CustomInput schema, not fallback to 'request'
+    assert declaration.name == 'sequence'
+    assert declaration.description == 'Process the query through multiple steps'
+
+    from google.adk.features import is_feature_enabled
+
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      assert declaration.parameters_json_schema == {
+          'title': 'CustomInput',
+          'type': 'object',
+          'properties': {
+              'query': {'title': 'Query', 'type': 'string'},
+              'language': {'title': 'Language', 'type': 'string'},
+          },
+          'required': ['query', 'language'],
+      }
+    else:
+      assert declaration.parameters.properties['query'].type == 'STRING'
+      assert declaration.parameters.properties['language'].type == 'STRING'
+      assert 'request' not in declaration.parameters.properties
+
+  def test_sequential_agent_without_input_schema_falls_back_to_request(self):
+    """Test that AgentTool falls back to 'request' when no sub-agent has input_schema."""
+
+    first_agent = Agent(
+        name='first_agent',
+        model=testing_utils.MockModel.create(responses=['response1']),
+    )
+
+    second_agent = Agent(
+        name='second_agent',
+        model=testing_utils.MockModel.create(responses=['response2']),
+    )
+
+    sequence = SequentialAgent(
+        name='sequence',
+        description='Process the query through multiple steps',
+        sub_agents=[first_agent, second_agent],
+    )
+
+    agent_tool = AgentTool(agent=sequence)
+    declaration = agent_tool._get_declaration()
+
+    # Should fall back to 'request' parameter
+    assert declaration.name == 'sequence'
+
+    from google.adk.features import is_feature_enabled
+
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      assert declaration.parameters_json_schema == {
+          'type': 'object',
+          'properties': {'request': {'type': 'string'}},
+          'required': ['request'],
+      }
+    else:
+      assert declaration.parameters.properties['request'].type == 'STRING'
+      assert 'query' not in declaration.parameters.properties
+
+  @mark.parametrize(
+      'env_variables',
+      [
+          'VERTEX',
+      ],
+      indirect=True,
+  )
+  def test_sequential_agent_with_last_sub_agent_output_schema(
+      self, env_variables
+  ):
+    """Test that AgentTool uses output_schema from last sub-agent of SequentialAgent."""
+
+    class CustomOutput(BaseModel):
+      result: str
+
+    first_agent = Agent(
+        name='first_agent',
+        model=testing_utils.MockModel.create(responses=['response1']),
+    )
+
+    second_agent = Agent(
+        name='second_agent',
+        model=testing_utils.MockModel.create(responses=['response2']),
+        output_schema=CustomOutput,
+    )
+
+    sequence = SequentialAgent(
+        name='sequence',
+        description='Process the query',
+        sub_agents=[first_agent, second_agent],
+    )
+
+    agent_tool = AgentTool(agent=sequence)
+    declaration = agent_tool._get_declaration()
+
+    # Should have object response schema from last sub-agent
+    from google.adk.features import is_feature_enabled
+
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      assert declaration.response_json_schema == {'type': 'object'}
+    else:
+      assert declaration.response is not None
+      assert declaration.response.type == types.Type.OBJECT
+
+  def test_nested_sequential_agent_input_schema(self):
+    """Test that AgentTool recursively finds input_schema in nested composite agents."""
+
+    class CustomInput(BaseModel):
+      deep_query: str
+
+    inner_agent = Agent(
+        name='inner_agent',
+        model=testing_utils.MockModel.create(responses=['response1']),
+        input_schema=CustomInput,
+    )
+
+    inner_sequence = SequentialAgent(
+        name='inner_sequence',
+        sub_agents=[inner_agent],
+    )
+
+    outer_sequence = SequentialAgent(
+        name='outer_sequence',
+        description='Nested sequence',
+        sub_agents=[inner_sequence],
+    )
+
+    agent_tool = AgentTool(agent=outer_sequence)
+    declaration = agent_tool._get_declaration()
+
+    # Should recursively find CustomInput from inner_agent
+    assert declaration.name == 'outer_sequence'
+
+    from google.adk.features import is_feature_enabled
+
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      assert declaration.parameters_json_schema == {
+          'title': 'CustomInput',
+          'type': 'object',
+          'properties': {
+              'deep_query': {'title': 'Deep Query', 'type': 'string'}
+          },
+          'required': ['deep_query'],
+      }
+    else:
+      assert 'deep_query' in declaration.parameters.properties
+      assert declaration.parameters.properties['deep_query'].type == 'STRING'
+      assert 'request' not in declaration.parameters.properties
+
+  @mark.parametrize(
+      'env_variables',
+      [
+          'GOOGLE_AI',
+          'VERTEX',
+      ],
+      indirect=True,
+  )
+  def test_sequential_agent_custom_schema_end_to_end(self, env_variables):
+    """Test end-to-end flow with SequentialAgent using custom input/output schema."""
+
+    class CustomInput(BaseModel):
+      custom_input: str
+
+    class CustomOutput(BaseModel):
+      custom_output: str
+
+    function_call_seq = Part.from_function_call(
+        name='sequence', args={'custom_input': 'test_input'}
+    )
+
+    mock_model = testing_utils.MockModel.create(
+        responses=[
+            function_call_seq,
+            '{"custom_output": "step1_response"}',
+            '{"custom_output": "final_response"}',
+            'root_response',
+        ]
+    )
+
+    first_agent = Agent(
+        name='first_agent',
+        model=mock_model,
+        input_schema=CustomInput,
+    )
+
+    second_agent = Agent(
+        name='second_agent',
+        model=mock_model,
+        output_schema=CustomOutput,
+        output_key='seq_output',
+    )
+
+    sequence = SequentialAgent(
+        name='sequence',
+        description='A sequential pipeline',
+        sub_agents=[first_agent, second_agent],
+    )
+
+    root_agent = Agent(
+        name='root_agent',
+        model=mock_model,
+        tools=[AgentTool(agent=sequence)],
+    )
+
+    runner = testing_utils.InMemoryRunner(root_agent)
+    runner.run('test1')
+
+    # Verify the tool declaration sent to LLM has the correct schema
+    # The first request is from root_agent, which should have the tool declaration
+    first_request = mock_model.requests[0]
+    tool_declarations = first_request.config.tools
+    assert len(tool_declarations) == 1
+
+    sequence_tool = tool_declarations[0].function_declarations[0]
+    assert sequence_tool.name == 'sequence'
+
+    from google.adk.features import is_feature_enabled
+
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      assert sequence_tool.parameters_json_schema == {
+          'title': 'CustomInput',
+          'type': 'object',
+          'properties': {
+              'custom_input': {'title': 'Custom Input', 'type': 'string'}
+          },
+          'required': ['custom_input'],
+      }
+    else:
+      # Should have 'custom_input' parameter from first sub-agent's input_schema
+      assert 'custom_input' in sequence_tool.parameters.properties
+      # Should NOT have the fallback 'request' parameter
+      assert 'request' not in sequence_tool.parameters.properties
+
+  @mark.asyncio
+  async def test_sequential_agent_returns_last_sub_agent_output(self):
+    """The tool result is the last sub-agent's output, not the whole pipeline's."""
+
+    class CustomOutput(BaseModel):
+      custom_output: str
+
+    function_call_seq = Part.from_function_call(
+        name='sequence', args={'request': 'test1'}
+    )
+
+    mock_model = testing_utils.MockModel.create(
+        responses=[
+            function_call_seq,
+            'a draft from the first step',
+            '{"custom_output": "final_response"}',
+            'root_response',
+        ]
+    )
+
+    first_agent = Agent(name='first_agent', model=mock_model)
+
+    second_agent = Agent(
+        name='second_agent',
+        model=mock_model,
+        output_schema=CustomOutput,
+        output_key='seq_output',
+    )
+
+    sequence = SequentialAgent(
+        name='sequence',
+        description='A sequential pipeline',
+        sub_agents=[first_agent, second_agent],
+    )
+
+    root_agent = Agent(
+        name='root_agent',
+        model=mock_model,
+        tools=[AgentTool(agent=sequence)],
+    )
+
+    runner = testing_utils.InMemoryRunner(root_agent)
+
+    # run_async, not run: run() drains the agent on a worker thread and would
+    # drop a validation error raised inside the tool.
+    events = await runner.run_async('test1')
+
+    assert testing_utils.simplify_events(events) == [
+        ('root_agent', function_call_seq),
+        (
+            'root_agent',
+            Part.from_function_response(
+                name='sequence', response={'custom_output': 'final_response'}
+            ),
+        ),
+        ('root_agent', 'root_response'),
+    ]
+
+  def test_empty_sequential_agent_falls_back_to_request(self):
+    """Test that AgentTool with empty SequentialAgent falls back to 'request'."""
+
+    sequence = SequentialAgent(
+        name='empty_sequence',
+        description='An empty sequence',
+        sub_agents=[],
+    )
+
+    agent_tool = AgentTool(agent=sequence)
+    declaration = agent_tool._get_declaration()
+
+    # Should fall back to 'request' parameter
+    from google.adk.features import is_feature_enabled
+
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      assert declaration.parameters_json_schema == {
+          'type': 'object',
+          'properties': {'request': {'type': 'string'}},
+          'required': ['request'],
+      }
+    else:
+      assert declaration.parameters.properties['request'].type == 'STRING'
+
+
+@mark.parametrize(
+    'args,expected_text',
+    [
+        (
+            {'brand': 'Nike', 'product': 'running shoes'},
+            '{"brand": "Nike", "product": "running shoes"}',
+        ),
+        (
+            {'request': 'find me Nike running shoes'},
+            'find me Nike running shoes',
+        ),
+        (
+            {'request': ''},
+            '',
+        ),
+    ],
+)
+@mark.asyncio
+async def test_no_schema_args_handling(monkeypatch, args, expected_text):
+  """AgentTool.run_async handles fallback schema cases properly.
+
+  - Non-'request' args are serialized as JSON.
+  - 'request' key is kept as plain text (backward compatibility).
+  - Empty string 'request' is correctly preserved instead of evaluating to
+  false.
+  """
+  captured = {}
+
+  async def _empty_async_generator():
+    if False:
+      yield None
+
+  class StubRunner:
+
+    def __init__(
+        self,
+        *,
+        app_name: str,
+        agent,
+        artifact_service,
+        session_service,
+        memory_service,
+        credential_service,
+        plugins,
+    ):
+      del artifact_service, memory_service, credential_service
+      self.agent = agent
+      self.session_service = session_service
+      self.plugin_manager = PluginManager(plugins=plugins)
+      self.app_name = app_name
+
+    def run_async(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        invocation_id=None,
+        new_message=None,
+        state_delta=None,
+        run_config=None,
+        yield_user_message: bool = False,
+        abort_signal: Optional[asyncio.Event] = None,
+        **kwargs,
+    ):
+      del (
+          user_id,
+          session_id,
+          invocation_id,
+          state_delta,
+          run_config,
+          yield_user_message,
+          abort_signal,
+          kwargs,
+      )
+      captured['new_message'] = new_message
+      return _empty_async_generator()
+
+    async def close(self):
+      pass
+
+  monkeypatch.setattr('google.adk.runners.Runner', StubRunner)
+
+  tool_agent = Agent(name='tool_agent', model='test-model')
+  agent_tool = AgentTool(agent=tool_agent)
+  root_agent = Agent(name='root_agent', model='test-model', tools=[agent_tool])
+
+  session_service = InMemorySessionService()
+  session = await session_service.create_session(
+      app_name='test_app', user_id='user'
+  )
+  invocation_context = InvocationContext(
+      artifact_service=InMemoryArtifactService(),
+      session_service=session_service,
+      memory_service=InMemoryMemoryService(),
+      plugin_manager=PluginManager(),
+      invocation_id='test-invocation',
+      agent=root_agent,
+      session=session,
+      run_config=RunConfig(),
+  )
+  tool_context = ToolContext(invocation_context)
+
+  await agent_tool.run_async(
+      args=args,
+      tool_context=tool_context,
+  )
+
+  assert captured['new_message'] is not None
+  text = captured['new_message'].parts[0].text
+  assert text == expected_text
+
+
+@pytest.fixture
+def setup_skip_summarization_runner():
+  def _setup_runner(tool_agent_model_responses, tool_agent_output_schema=None):
+    tool_agent_model = testing_utils.MockModel.create(
+        responses=tool_agent_model_responses
+    )
+    tool_agent = Agent(
+        name='tool_agent',
+        model=tool_agent_model,
+        output_schema=tool_agent_output_schema,
+    )
+
+    agent_tool = AgentTool(agent=tool_agent, skip_summarization=True)
+
+    root_agent_model = testing_utils.MockModel.create(
+        responses=[
+            function_call_no_schema,
+            'final_summary_text_that_should_not_be_reached',
+        ]
+    )
+
+    root_agent = Agent(
+        name='root_agent',
+        model=root_agent_model,
+        tools=[agent_tool],
+    )
+    return testing_utils.InMemoryRunner(root_agent)
+
+  return _setup_runner
+
+
+def test_agent_tool_skip_summarization_has_text_output(
+    setup_skip_summarization_runner,
+):
+  """Tests that when skip_summarization is True, the final event contains text content."""
+  runner = setup_skip_summarization_runner(
+      tool_agent_model_responses=['tool_response_text']
+  )
+  events = runner.run('start')
+
+  final_events = [e for e in events if e.is_final_response()]
+  assert final_events
+  last_event = final_events[-1]
+  assert last_event.is_final_response()
+
+  assert any(p.function_response for p in last_event.content.parts)
+
+  assert [p.text for p in last_event.content.parts if p.text] == [
+      'tool_response_text'
+  ]
+
+
+def test_agent_tool_skip_summarization_preserves_json_string_output(
+    setup_skip_summarization_runner,
+):
+  """Tests that structured output string is preserved as text when skipping summarization."""
+  runner = setup_skip_summarization_runner(
+      tool_agent_model_responses=['{"field": "value"}']
+  )
+  events = runner.run('start')
+
+  final_events = [e for e in events if e.is_final_response()]
+  assert final_events
+  last_event = final_events[-1]
+  assert last_event.is_final_response()
+
+  text_parts = [p.text for p in last_event.content.parts if p.text]
+
+  # Check that the JSON string content is preserved exactly
+  assert text_parts == ['{"field": "value"}']
+
+
+def test_agent_tool_skip_summarization_handles_non_string_result(
+    setup_skip_summarization_runner,
+):
+  """Tests that non-string (dict) output is correctly serialized as JSON text."""
+
+  class CustomOutput(BaseModel):
+    value: int
+
+  runner = setup_skip_summarization_runner(
+      tool_agent_model_responses=['{"value": 123}'],
+      tool_agent_output_schema=CustomOutput,
+  )
+  events = runner.run('start')
+
+  final_events = [e for e in events if e.is_final_response()]
+  assert final_events
+  last_event = final_events[-1]
+
+  text_parts = [p.text for p in last_event.content.parts if p.text]
+
+  assert text_parts == ['{"value": 123}']
+
+
+# ---------------------------------------------------------------------------
+# Tests for input_schema message wrapping
+# ---------------------------------------------------------------------------
+
+
+async def _run_agent_tool_and_capture_content(
+    args: dict,
+    input_schema=None,
+    output_schema=None,
+) -> types.Content:
+  """Drives AgentTool and captures the Content passed to the inner agent.
+
+  This uses a stub Runner (same pattern as test_agent_tool_inherits_parent_app_name)
+  to intercept the new_message without executing the actual agent pipeline.
+  """
+  if input_schema is not None:
+    inner = LlmAgent(
+        name='inner_agent',
+        description='captures input',
+        model=testing_utils.MockModel.create(responses=['done']),
+        input_schema=input_schema,
+        output_schema=output_schema,
+    )
+  else:
+    inner = Agent(name='inner_agent', model='test-model')
+
+  new_message_holder: list = []
+
+  async def _empty_async_generator():
+    if False:
+      yield None
+
+  class _StubRunner:
+
+    def __init__(
+        self,
+        *,
+        app_name,
+        agent,
+        artifact_service,
+        session_service,
+        memory_service,
+        credential_service,
+        plugins,
+    ):
+      del artifact_service, memory_service, credential_service
+      self.agent = agent
+      self.session_service = session_service
+      self.plugin_manager = PluginManager(plugins=plugins)
+      self.app_name = app_name
+
+    def run_async(
+        self,
+        *,
+        user_id,
+        session_id,
+        invocation_id=None,
+        new_message=None,
+        state_delta=None,
+        run_config=None,
+        yield_user_message: bool = False,
+        abort_signal: Optional[asyncio.Event] = None,
+        **kwargs,
+    ):
+      del (
+          user_id,
+          session_id,
+          invocation_id,
+          state_delta,
+          run_config,
+          yield_user_message,
+          abort_signal,
+          kwargs,
+      )
+      new_message_holder.append(new_message)
+      return _empty_async_generator()
+
+    async def close(self):
+      pass
+
+  with patch.object(_runners_module, 'Runner', _StubRunner):
+    agent_tool = AgentTool(agent=inner)
+    session_service = InMemorySessionService()
+    session = await session_service.create_session(
+        app_name='test_app', user_id='test_user'
+    )
+    invocation_context = InvocationContext(
+        invocation_id='invocation_id',
+        agent=inner,
+        session=session,
+        session_service=session_service,
+    )
+    tool_context = ToolContext(invocation_context=invocation_context)
+    await agent_tool.run_async(args=args, tool_context=tool_context)
+
+  return new_message_holder[0] if new_message_holder else None
+
+
+@mark.asyncio
+async def test_run_async_no_input_schema_passes_request_unchanged():
+  """Without input_schema, the message is args['request'] verbatim."""
+  content = await _run_agent_tool_and_capture_content(
+      args={'request': 'hello world'},
+      input_schema=None,
+  )
+
+  assert content is not None
+  assert len(content.parts) == 1
+  assert content.parts[0].text == 'hello world'
+
+
+class _RoundTripInput(BaseModel):
+  query: str
+  limit: int
+
+
+class _RoundTripOutput(BaseModel):
+  result: str
+
+
+@mark.asyncio
+@pytest.mark.parametrize('output_schema', [None, _RoundTripOutput])
+async def test_run_async_with_input_schema_passes_bare_json(output_schema):
+  """With input_schema the message is the bare serialized payload."""
+  content = await _run_agent_tool_and_capture_content(
+      args={'query': 'hello', 'limit': 5},
+      input_schema=_RoundTripInput,
+      output_schema=output_schema,
+  )
+
+  assert content is not None
+  assert len(content.parts) == 1
+  payload = json.loads(content.parts[0].text)
+  assert payload == {'query': 'hello', 'limit': 5}
+
+
+@mark.asyncio
+@pytest.mark.parametrize('output_schema', [None, _RoundTripOutput])
+async def test_run_async_input_schema_content_survives_node_validation(
+    output_schema,
+):
+  """The message AgentTool sends must validate against the same input_schema.
+
+  The node runtime re-validates the first user message against the inner
+  agent's input_schema, so anything AgentTool prepends to the payload breaks
+  the call before the agent runs. This drives the real validator rather than
+  the stubbed runner used above.
+  """
+  content = await _run_agent_tool_and_capture_content(
+      args={'query': 'hello', 'limit': 5},
+      input_schema=_RoundTripInput,
+      output_schema=output_schema,
+  )
+
+  assert validate_node_data(
+      _RoundTripInput, content, preserve_content=False
+  ) == {'query': 'hello', 'limit': 5}
+
+
+class _SlowMockModel(testing_utils.MockModel):
+  """Answers after a delay, so the runner waits on the abort signal meanwhile."""
+
+  async def generate_content_async(
+      self, llm_request: LlmRequest, stream: bool = False
+  ):
+    await asyncio.sleep(0.2)
+    async for response in super().generate_content_async(llm_request, stream):
+      yield response
+
+
+def _nested_llm_agent() -> LlmAgent:
+  # An LlmAgent, so the nested Runner takes the node path that awaits the
+  # abort signal.
+  return LlmAgent(
+      name='tool_agent',
+      model=_SlowMockModel.create(responses=['nested reply']),
+  )
+
+
+async def _caller_context_bound_to_this_loop(
+    tool_agent: BaseAgent,
+) -> InvocationContext:
+  """Returns a caller context whose abort signal is bound to the running loop."""
+  root_agent = Agent(
+      name='root_agent', model='test-model', tools=[AgentTool(agent=tool_agent)]
+  )
+  invocation_context = await testing_utils.create_invocation_context(
+      agent=root_agent
+  )
+  # Await the signal once so it binds to this loop, as the caller's runner does.
+  with contextlib.suppress(asyncio.TimeoutError):
+    await asyncio.wait_for(
+        invocation_context._abort_signal.wait(),  # pylint: disable=protected-access
+        timeout=0.01,
+    )
+  return invocation_context
+
+
+@mark.asyncio
+async def test_agent_tool_in_tool_thread_pool_returns_nested_reply():
+  """In the tool thread pool, the nested run is not aborted by the caller's signal.
+
+  The pool runs the tool in a fresh event loop on a worker thread, where the
+  caller's abort signal cannot be awaited.
+  """
+  tool_agent = _nested_llm_agent()
+  invocation_context = await _caller_context_bound_to_this_loop(tool_agent)
+
+  result = await _call_tool_in_thread_pool(
+      AgentTool(agent=tool_agent),
+      {'request': 'hello'},
+      ToolContext(invocation_context),
+  )
+
+  assert result == 'nested reply'
+
+
+@mark.asyncio
+@mark.parametrize(
+    ('parent_ttl_seconds', 'expected_child_ttl_seconds'),
+    [
+        (1800, 300),
+        (120, 120),
+        (None, None),
+    ],
+    ids=[
+        'ttl_above_cap_clamped_to_300s',
+        'ttl_below_cap_preserved',
+        'no_parent_cache_config_remains_none',
+    ],
+)
+async def test_agent_tool_propagates_cache_config(
+    parent_ttl_seconds: int | None,
+    expected_child_ttl_seconds: int | None,
+):
+  """The child sees the parent's cache config with its TTL capped at 300s."""
+  from google.adk.agents.context_cache_config import ContextCacheConfig
+  from google.adk.apps.app import App
+
+  child_model = testing_utils.MockModel.create(responses=['child result'])
+  child = LlmAgent(name='tool_agent', model=child_model)
+  parent_model = testing_utils.MockModel.create(
+      responses=[function_call_no_schema, 'done']
+  )
+  parent = LlmAgent(
+      name='root_agent', model=parent_model, tools=[AgentTool(agent=child)]
+  )
+  cache_config = (
+      ContextCacheConfig(
+          min_tokens=1024, ttl_seconds=parent_ttl_seconds, cache_intervals=5
+      )
+      if parent_ttl_seconds is not None
+      else None
+  )
+  app = App(
+      name='cached_parent_app',
+      root_agent=parent,
+      context_cache_config=cache_config,
+  )
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  await runner.run_async('go')
+
+  (child_request,) = child_model.requests
+  if expected_child_ttl_seconds is None:
+    assert [r.cache_config for r in parent_model.requests] == [None, None]
+    assert child_request.cache_config is None
+  else:
+    assert [r.cache_config.ttl_seconds for r in parent_model.requests] == [
+        parent_ttl_seconds,
+        parent_ttl_seconds,
+    ]
+    assert child_request.cache_config is not None
+    assert child_request.cache_config.ttl_seconds == expected_child_ttl_seconds
+    assert child_request.cache_config.min_tokens == 1024
+    assert child_request.cache_config.cache_intervals == 5
+
+
+@mark.asyncio
+async def test_agent_tool_child_cache_state_starts_empty_on_every_call():
+  """Each call runs the child in a new session, so no cache state carries over.
+
+  Gemini creates an explicit cache only when an earlier response in the same
+  session left cache metadata behind. That handoff happens within one AgentTool
+  call and never across calls.
+  """
+  from google.adk.agents.context_cache_config import ContextCacheConfig
+  from google.adk.apps.app import App
+  from google.adk.models.cache_metadata import CacheMetadata
+
+  fingerprint_only = CacheMetadata(fingerprint='child-fp', contents_count=0)
+  usage = types.GenerateContentResponseUsageMetadata(prompt_token_count=4096)
+
+  def lookup(query: str) -> str:
+    """Looks up a query."""
+    return f'result for {query}'
+
+  mock_model = testing_utils.MockModel.create(
+      responses=[
+          LlmResponse(
+              content=types.Content(
+                  role='model',
+                  parts=[
+                      Part.from_function_call(
+                          name='lookup', args={'query': 'a'}
+                      )
+                  ],
+              ),
+              cache_metadata=fingerprint_only,
+              usage_metadata=usage,
+          ),
+          LlmResponse(
+              content=types.Content(role='model', parts=[Part(text='first')]),
+              usage_metadata=usage,
+          ),
+          LlmResponse(
+              content=types.Content(role='model', parts=[Part(text='second')]),
+              cache_metadata=fingerprint_only,
+              usage_metadata=usage,
+          ),
+      ]
+  )
+  inner = LlmAgent(name='tool_agent', model=mock_model, tools=[lookup])
+  parent_model = testing_utils.MockModel.create(
+      responses=[
+          function_call_no_schema,
+          'first done',
+          function_call_no_schema,
+          'second done',
+      ]
+  )
+  parent = LlmAgent(
+      name='root_agent', model=parent_model, tools=[AgentTool(agent=inner)]
+  )
+  app = App(
+      name='cached_parent_app',
+      root_agent=parent,
+      context_cache_config=ContextCacheConfig(
+          min_tokens=1024, ttl_seconds=1800, cache_intervals=5
+      ),
+  )
+  runner = testing_utils.InMemoryRunner(app=app)
+
+  await runner.run_async('one')
+  await runner.run_async('two')
+
+  first_call_start, first_call_after_tool, second_call_start = (
+      mock_model.requests
+  )
+  assert [r.cache_config.ttl_seconds for r in mock_model.requests] == [
+      300,
+      300,
+      300,
+  ]
+  assert first_call_start.cache_metadata is None
+  assert first_call_start.cacheable_contents_token_count is None
+  assert first_call_after_tool.cache_metadata == fingerprint_only
+  assert first_call_after_tool.cacheable_contents_token_count == 4096
+  assert second_call_start.cache_metadata is None
+  assert second_call_start.cacheable_contents_token_count is None
+
+
+_non_agent_node = FunctionNode(func=lambda: None, name='non_agent_node')
+
+
+def test_from_config_rejects_non_agent_node():
+  config = ToolArgsConfig(agent={'code': f'{__name__}._non_agent_node'})
+
+  with pytest.raises(ValueError, match='AgentTool requires an agent'):
+    AgentTool.from_config(config, '/tmp/root_agent.yaml')
